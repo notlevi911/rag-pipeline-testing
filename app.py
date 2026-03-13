@@ -23,17 +23,47 @@
 #     - chunk_stats:    stats about the chunks for display (dict)
 #
 # MODELS USED:
-#   - Chat:       gemini-2.5-flash  (FREE via Google AI Studio)
-#   - Embeddings: models/text-embedding-004  (FREE via Google AI Studio)
+#   - Chat:       gemini-2.5-flash       (FREE via Google AI Studio)
+#   - Embeddings: gemini-embedding-001   (FREE via Google AI Studio)
 #   Get your key at: https://aistudio.google.com/app/apikey
+#
+# SECRETS LOADING ORDER (first one wins):
+#   1. .streamlit/secrets.toml  ← Streamlit-native, works locally + on Streamlit Cloud
+#   2. .env file                ← fallback for non-Streamlit environments
+#
+# WHY BRIDGE st.secrets INTO os.environ?
+#   st.secrets is only readable via st.secrets["KEY"]. But all the downstream
+#   libraries (google-genai, LangChain) read from os.environ["KEY"] directly.
+#   So we copy every secret into os.environ once at startup so nothing else
+#   in the codebase needs to know about st.secrets at all.
 # =============================================================================
 
 import os
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load .env file FIRST — before importing anything that needs GOOGLE_API_KEY
+# --- Step 1: load .env as baseline (no-op if file doesn't exist) ---
 load_dotenv()
+
+# --- Step 2: overlay st.secrets on top, pushing every key into os.environ ---
+# st.secrets reads from .streamlit/secrets.toml locally, or from the
+# Streamlit Community Cloud dashboard in production.
+# Only top-level keys (not keys inside [sections]) become env vars here.
+_KNOWN_SECRETS = [
+    "GOOGLE_API_KEY",
+    "CHAT_MODEL",
+    "EMBEDDING_MODEL",
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP",
+    "TOP_K_CHUNKS",
+]
+for _key in _KNOWN_SECRETS:
+    try:
+        # st.secrets raises KeyError if the key isn't present — that's fine,
+        # we just leave whatever os.getenv already has from the .env file.
+        os.environ[_key] = st.secrets[_key]
+    except KeyError:
+        pass
 
 from rag.loader import load_pdf, get_pdf_metadata
 from rag.splitter import split_text_with_metadata, get_chunk_stats
@@ -137,9 +167,30 @@ if "pdf_metadata"   not in st.session_state:
 # =============================================================================
 
 def check_api_key() -> bool:
-    """Returns True if GOOGLE_API_KEY is set, False otherwise."""
+    """
+    Returns True if GOOGLE_API_KEY is available from any source.
+
+    Checks in priority order:
+      1. os.environ  (already bridged from st.secrets or .env above)
+      2. st.secrets  (direct check, catches edge cases)
+
+    Also guards against the placeholder value from the template file.
+    """
+    # Primary check — os.environ covers both .env and st.secrets (bridged above)
     key = os.getenv("GOOGLE_API_KEY", "")
-    return bool(key and key.strip() and key != "your-google-api-key-here")
+    if key and key.strip() and key not in ("your-google-api-key-here", ""):
+        return True
+
+    # Fallback — check st.secrets directly in case the bridge loop missed it
+    try:
+        key = st.secrets["GOOGLE_API_KEY"]
+        if key and key.strip() and key != "your-google-api-key-here":
+            os.environ["GOOGLE_API_KEY"] = key   # ensure it's in os.environ
+            return True
+    except KeyError:
+        pass
+
+    return False
 
 
 # =============================================================================
@@ -248,12 +299,17 @@ with st.sidebar:
 
     # --- API Key Status ---
     if check_api_key():
-        st.success("🔑 Google API key loaded", icon="✅")
+        # Show which source the key came from
+        source = "st.secrets / secrets.toml" if "GOOGLE_API_KEY" in st.secrets else ".env file"
+        st.success(f"🔑 Google API key loaded via `{source}`", icon="✅")
     else:
         st.error(
             "🔑 **Google API key missing!**\n\n"
-            "Create a `.env` file in the project root with:\n"
-            "`GOOGLE_API_KEY=your-key-here`\n\n"
+            "**Option A — Streamlit secrets (recommended):**\n"
+            "Add to `.streamlit/secrets.toml`:\n"
+            "```\nGOOGLE_API_KEY = \"your-key-here\"\n```\n\n"
+            "**Option B — .env file:**\n"
+            "```\nGOOGLE_API_KEY=your-key-here\n```\n\n"
             "Get a free key at: https://aistudio.google.com/app/apikey",
             icon="❌"
         )
