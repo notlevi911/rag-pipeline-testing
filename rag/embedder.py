@@ -126,25 +126,40 @@ class GeminiEmbeddings(Embeddings):
         Each chunk in `texts` gets its own vector in the returned list.
 
         HOW IT WORKS:
-            client.models.embed_content() sends all texts to the Gemini
-            Embeddings API in one request. The response contains one
-            ContentEmbedding per input text, each with a .values list
-            of floats (768 numbers for text-embedding-004).
+            client.models.embed_content() sends texts to the Gemini
+            Embeddings API. The API enforces a hard limit of 100 texts
+            per call (BatchEmbedContentsRequest.requests max = 100).
+            We split the full list into batches of BATCH_SIZE, call the
+            API once per batch, then concatenate all results together.
+
+            Example — 350 chunks:
+              Batch 1: texts[0:100]   → 100 embeddings
+              Batch 2: texts[100:200] → 100 embeddings
+              Batch 3: texts[200:300] → 100 embeddings
+              Batch 4: texts[300:350] →  50 embeddings
+              Combined               → 350 embeddings ✅
 
         Args:
             texts (List[str]): The chunk texts to embed. Can be 1 to many.
 
         Returns:
             List[List[float]]: One float vector per input text.
-                               Shape: (len(texts), 768)
+                               Shape: (len(texts), 3072)
         """
-        response = self.client.models.embed_content(
-            model=self.model,
-            contents=texts,       # pass the full list — SDK batches it
-        )
-        # response.embeddings → List[ContentEmbedding]
-        # each ContentEmbedding has a .values attribute → List[float]
-        return [embedding.values for embedding in response.embeddings]
+        BATCH_SIZE = 100   # Google Embedding API hard limit per request
+        all_embeddings: List[List[float]] = []
+
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i : i + BATCH_SIZE]
+            response = self.client.models.embed_content(
+                model=self.model,
+                contents=batch,
+            )
+            all_embeddings.extend(
+                [embedding.values for embedding in response.embeddings]
+            )
+
+        return all_embeddings
 
     def embed_query(self, text: str) -> List[float]:
         """
